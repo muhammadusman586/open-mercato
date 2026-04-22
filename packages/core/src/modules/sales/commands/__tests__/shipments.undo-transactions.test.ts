@@ -2,13 +2,14 @@
 
 import { commandRegistry } from '@open-mercato/shared/lib/commands/registry'
 import { findOneWithDecryption } from '@open-mercato/shared/lib/encryption/find'
+import { CrudHttpError } from '@open-mercato/shared/lib/crud/errors'
 
 jest.mock('@open-mercato/shared/lib/i18n/server', () => ({
   resolveTranslations: async () => ({
     locale: 'en',
     dict: {},
     t: (key: string) => key,
-    translate: (key: string) => key,
+    translate: (_key: string, fallback?: string) => fallback ?? _key,
   }),
 }))
 
@@ -153,5 +154,145 @@ describe('shipment undo handlers — transactional wrapping', () => {
     await undo?.({ logEntry: envelope.logEntry, ctx: envelope.ctx as any } as any)
 
     expect(envelope.transactional).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Financial state guards — updateShipmentCommand.execute() must reject edits
+// when the parent order is fully refunded or fully paid. (issue #1624)
+// ---------------------------------------------------------------------------
+
+describe('updateShipmentCommand.execute — financial state guards', () => {
+  beforeEach(() => {
+    ;(findOneWithDecryption as jest.Mock).mockReset().mockResolvedValue(null)
+  })
+
+  function buildShipmentWithOrder(orderAmounts: {
+    paidTotalAmount?: string
+    refundedTotalAmount?: string
+    grandTotalGrossAmount?: string
+  }) {
+    return {
+      id: TEST_SHIPMENT_ID,
+      tenantId: TEST_TENANT_ID,
+      organizationId: TEST_ORG_ID,
+      order: {
+        id: TEST_ORDER_ID,
+        paidTotalAmount: orderAmounts.paidTotalAmount ?? '0',
+        refundedTotalAmount: orderAmounts.refundedTotalAmount ?? '0',
+        grandTotalGrossAmount: orderAmounts.grandTotalGrossAmount ?? '100.00',
+      },
+      items: { getItems: () => [] },
+    }
+  }
+
+  function buildExecuteCtx() {
+    const envelope = buildEnvelope({})
+    return envelope.ctx
+  }
+
+  const baseInput = {
+    id: TEST_SHIPMENT_ID,
+    orderId: TEST_ORDER_ID,
+    tenantId: TEST_TENANT_ID,
+    organizationId: TEST_ORG_ID,
+  }
+
+  it('rejects update when order is fully refunded (422)', async () => {
+    const execute = commandRegistry.get('sales.shipments.update')?.execute
+    expect(execute).toBeInstanceOf(Function)
+
+    const shipment = buildShipmentWithOrder({
+      refundedTotalAmount: '100.00',
+      grandTotalGrossAmount: '100.00',
+    })
+    ;(findOneWithDecryption as jest.Mock).mockResolvedValue(shipment)
+
+    await expect(execute!(baseInput, buildExecuteCtx() as any)).rejects.toMatchObject({
+      status: 422,
+      body: { error: expect.stringContaining('fully returned') },
+    })
+  })
+
+  it('rejects update when order is fully paid (422)', async () => {
+    const execute = commandRegistry.get('sales.shipments.update')?.execute
+    expect(execute).toBeInstanceOf(Function)
+
+    const shipment = buildShipmentWithOrder({
+      paidTotalAmount: '100.00',
+      grandTotalGrossAmount: '100.00',
+    })
+    ;(findOneWithDecryption as jest.Mock).mockResolvedValue(shipment)
+
+    await expect(execute!(baseInput, buildExecuteCtx() as any)).rejects.toMatchObject({
+      status: 422,
+      body: { error: expect.stringContaining('payment is completed') },
+    })
+  })
+
+  it('allows update when order is only partially paid', async () => {
+    const execute = commandRegistry.get('sales.shipments.update')?.execute
+    expect(execute).toBeInstanceOf(Function)
+
+    const shipment = buildShipmentWithOrder({
+      paidTotalAmount: '50.00',
+      grandTotalGrossAmount: '100.00',
+    })
+    ;(findOneWithDecryption as jest.Mock).mockResolvedValue(shipment)
+
+    try {
+      await execute!(baseInput, buildExecuteCtx() as any)
+    } catch (err: any) {
+      expect(err).not.toBeInstanceOf(CrudHttpError)
+    }
+  })
+
+  it('handles floating-point tolerance correctly', async () => {
+    const execute = commandRegistry.get('sales.shipments.update')?.execute
+    expect(execute).toBeInstanceOf(Function)
+
+    const shipment = buildShipmentWithOrder({
+      paidTotalAmount: '99.9999',
+      grandTotalGrossAmount: '100.00',
+    })
+    ;(findOneWithDecryption as jest.Mock).mockResolvedValue(shipment)
+
+    await expect(execute!(baseInput, buildExecuteCtx() as any)).rejects.toMatchObject({
+      status: 422,
+      body: { error: expect.stringContaining('payment is completed') },
+    })
+  })
+
+  it('allows update when all amounts are zero', async () => {
+    const execute = commandRegistry.get('sales.shipments.update')?.execute
+    expect(execute).toBeInstanceOf(Function)
+
+    const shipment = buildShipmentWithOrder({
+      paidTotalAmount: '0',
+      refundedTotalAmount: '0',
+      grandTotalGrossAmount: '0',
+    })
+    ;(findOneWithDecryption as jest.Mock).mockResolvedValue(shipment)
+
+    await expect(execute!(baseInput, buildExecuteCtx() as any)).rejects.toMatchObject({
+      status: 422,
+    })
+  })
+
+  it('fully refunded takes priority over fully paid', async () => {
+    const execute = commandRegistry.get('sales.shipments.update')?.execute
+    expect(execute).toBeInstanceOf(Function)
+
+    const shipment = buildShipmentWithOrder({
+      paidTotalAmount: '100.00',
+      refundedTotalAmount: '100.00',
+      grandTotalGrossAmount: '100.00',
+    })
+    ;(findOneWithDecryption as jest.Mock).mockResolvedValue(shipment)
+
+    await expect(execute!(baseInput, buildExecuteCtx() as any)).rejects.toMatchObject({
+      status: 422,
+      body: { error: expect.stringContaining('fully returned') },
+    })
   })
 })
